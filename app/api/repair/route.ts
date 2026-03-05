@@ -1,74 +1,88 @@
 import { NextRequest } from "next/server";
-import { anthropic, buildAnalyzePrompt } from "@/lib/claude";
+import { anthropic, buildSystemPrompt } from "@/lib/claude";
+import type { HistoryEntry } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-type ImageBlock = {
-  type: "image";
-  source: { type: "base64"; media_type: "image/jpeg" | "image/png" | "image/webp"; data: string };
+type ImageSource = {
+  type: "base64";
+  media_type: "image/jpeg" | "image/png" | "image/webp";
+  data: string;
 };
-type TextBlock = { type: "text"; text: string };
-type ContentBlock = TextBlock | ImageBlock;
+
+function toImageBlock(dataUrl: string) {
+  const data = dataUrl.replace(/^data:image\/\w+;base64,/, "");
+  const mediaType: ImageSource["media_type"] = dataUrl.startsWith("data:image/png")
+    ? "image/png"
+    : dataUrl.startsWith("data:image/webp")
+    ? "image/webp"
+    : "image/jpeg";
+  return { type: "image" as const, source: { type: "base64" as const, media_type: mediaType, data } };
+}
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
-  const { vehicle, image, repairType, previousStep = 0 } = body;
+  const { vehicle, image, repairType, history = [] }: {
+    vehicle: { year: string; make: string; model: string };
+    image: string | null;
+    repairType: string;
+    history: HistoryEntry[];
+  } = body;
 
   if (!vehicle?.year || !vehicle?.make || !vehicle?.model || !repairType) {
     return Response.json({ error: "Missing required fields" }, { status: 400 });
   }
 
-  const systemPrompt = buildAnalyzePrompt({
-    ...vehicle,
-    repairType,
-    previousStep,
-  });
+  // Build multi-turn conversation — last 4 steps for context (keeps payload manageable)
+  const recentHistory = history.slice(-4);
+  type MessageParam = { role: "user" | "assistant"; content: string | Array<{ type: string; [key: string]: unknown }> };
+  const messages: MessageParam[] = [];
 
-  const content: ContentBlock[] = [];
-
-  if (image) {
-    const base64 = image.replace(/^data:image\/\w+;base64,/, "");
-    const mediaType = image.startsWith("data:image/png")
-      ? ("image/png" as const)
-      : image.startsWith("data:image/webp")
-      ? ("image/webp" as const)
-      : ("image/jpeg" as const);
-    content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: base64 } });
+  for (const entry of recentHistory) {
+    const userContent: Array<{ type: string; [key: string]: unknown }> = [];
+    if (entry.image) userContent.push(toImageBlock(entry.image));
+    userContent.push({ type: "text", text: `Step ${entry.result.step}: this is what my camera showed.` });
+    messages.push({ role: "user", content: userContent });
+    messages.push({ role: "assistant", content: JSON.stringify(entry.result) });
   }
 
-  content.push({
+  // Current user turn
+  const currentContent: Array<{ type: string; [key: string]: unknown }> = [];
+  if (image) currentContent.push(toImageBlock(image));
+  currentContent.push({
     type: "text",
-    text: previousStep === 0
-      ? `Start the ${repairType} repair. ${image ? "I've pointed my camera at the car." : "Guide me on where to look first."}`
-      : `I completed step ${previousStep}. ${image ? "Here's what my camera sees now." : "What's next?"}`,
+    text: history.length === 0
+      ? `Start the ${repairType} repair.${image ? " Here is what my camera sees." : " Guide me on where to look first."}`
+      : `Here is what my camera sees now. What should I do next?`,
   });
+  messages.push({ role: "user", content: currentContent });
 
-  const response = await anthropic.messages.create({
+  // Stream response so frontend gets highlight early
+  const stream = anthropic.messages.stream({
     model: "claude-sonnet-4-6",
     max_tokens: 512,
-    system: systemPrompt,
-    messages: [{ role: "user", content }],
+    system: buildSystemPrompt({ ...vehicle, repairType }),
+    messages: messages as Parameters<typeof anthropic.messages.stream>[0]["messages"],
   });
 
-  const raw = response.content[0].type === "text" ? response.content[0].text.trim() : "";
+  const encoder = new TextEncoder();
+  const readable = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const chunk of stream) {
+          if (chunk.type === "content_block_delta" && chunk.delta.type === "text_delta") {
+            controller.enqueue(encoder.encode(chunk.delta.text));
+          }
+        }
+      } catch (err) {
+        controller.error(err);
+      } finally {
+        controller.close();
+      }
+    },
+  });
 
-  // Strip any markdown code fences Claude might add
-  const jsonStr = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-
-  try {
-    const parsed = JSON.parse(jsonStr);
-    return Response.json(parsed);
-  } catch {
-    // Fallback if JSON parsing fails
-    return Response.json({
-      step: previousStep + 1,
-      totalSteps: 5,
-      instruction: raw.slice(0, 120),
-      highlight: null,
-      highlightLabel: null,
-      safetyWarning: null,
-      done: false,
-      nextAction: "Continue with the repair.",
-    });
-  }
+  return new Response(readable, {
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
 }
