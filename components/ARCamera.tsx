@@ -299,6 +299,12 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
   const [liveResult, setLiveResult] = useState<Partial<AnalysisResult> | null>(null);
   const [sessionHistory, setSessionHistory] = useState<HistoryEntry[]>([]);
 
+  // Debug state
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugFrame, setDebugFrame] = useState<string | null>(null);
+  const [debugRaw, setDebugRaw] = useState<string>("");
+  const [debugPrompt, setDebugPrompt] = useState<string>("");
+
   // Refs for callbacks
   const liveResultRef = useRef<Partial<AnalysisResult> | null>(null);
   const sessionHistoryRef = useRef<HistoryEntry[]>([]);
@@ -543,6 +549,7 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
     setAnalyzing(true);
 
     const rawImage = withImage ? captureFrame() : null;
+    if (rawImage) setDebugFrame(rawImage);
 
     try {
       const res = await fetch("/api/repair", {
@@ -584,6 +591,9 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
         // Live update instruction as it streams
         if (partial.instruction) setLiveResult((prev) => ({ ...prev, ...partial }));
       }
+
+      // Store raw response for debug
+      setDebugRaw(buffer);
 
       // Parse final
       const jsonStr = buffer.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
@@ -644,6 +654,17 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
       setAnalyzing(false);
     }
   }, [vehicle, repairType, captureFrame, speak]);
+
+  // ── Fetch system prompt for debug panel ────────────────────────────────────
+  useEffect(() => {
+    const params = new URLSearchParams({
+      year: vehicle.year, make: vehicle.make, model: vehicle.model, repairType,
+    });
+    fetch(`/api/debug-prompt?${params}`)
+      .then((r) => r.json())
+      .then((d) => setDebugPrompt(d.prompt ?? ""))
+      .catch(() => {});
+  }, [vehicle, repairType]); // eslint-disable-line
 
   // ── First analysis on camera ready ─────────────────────────────────────────
   const initializedRef = useRef(false);
@@ -721,12 +742,20 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
           {result && <span className="text-xs text-zinc-400 ml-1">{result.step}/{result.totalSteps}</span>}
         </div>
 
-        <button
-          onClick={() => setVoiceEnabled((v) => !v)}
-          className="bg-black/55 backdrop-blur-sm text-lg w-9 h-9 rounded-xl flex items-center justify-center"
-        >
-          {voiceEnabled ? "🔊" : "🔇"}
-        </button>
+        <div className="flex gap-1.5">
+          <button
+            onClick={() => setDebugOpen((v) => !v)}
+            className={`text-xs px-2.5 py-1.5 rounded-xl backdrop-blur-sm font-mono font-semibold transition-colors ${debugOpen ? "bg-yellow-400/90 text-black" : "bg-black/55 text-zinc-400"}`}
+          >
+            DEBUG
+          </button>
+          <button
+            onClick={() => setVoiceEnabled((v) => !v)}
+            className="bg-black/55 backdrop-blur-sm text-lg w-9 h-9 rounded-xl flex items-center justify-center"
+          >
+            {voiceEnabled ? "🔊" : "🔇"}
+          </button>
+        </div>
       </div>
 
       {/* Bottom instruction card */}
@@ -766,6 +795,66 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
           </div>
         </div>
       </div>
+
+      {/* Debug panel */}
+      {debugOpen && (
+        <div className="absolute inset-0 z-30 bg-black/95 overflow-y-auto">
+          <div className="p-4 pb-8">
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-yellow-400 font-mono font-bold text-sm">DEBUG INSPECTOR</span>
+              <button
+                onClick={() => setDebugOpen(false)}
+                className="text-zinc-400 bg-zinc-800 px-3 py-1 rounded-lg text-sm"
+              >
+                Close
+              </button>
+            </div>
+
+            {/* Last captured frame */}
+            <div className="mb-4">
+              <p className="text-yellow-400 font-mono text-xs uppercase tracking-wider mb-2">
+                Last frame sent to Claude ({sessionHistory.length} steps in history)
+              </p>
+              {debugFrame ? (
+                <img src={debugFrame} alt="last frame" className="w-full rounded-lg border border-zinc-700" />
+              ) : (
+                <p className="text-zinc-500 text-xs">No frame captured yet</p>
+              )}
+            </div>
+
+            {/* Raw Claude response */}
+            <div className="mb-4">
+              <p className="text-yellow-400 font-mono text-xs uppercase tracking-wider mb-2">
+                Raw Claude response
+              </p>
+              {debugRaw ? (
+                <pre className="text-green-400 font-mono text-xs bg-zinc-900 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all border border-zinc-700">
+                  {(() => {
+                    try { return JSON.stringify(JSON.parse(debugRaw), null, 2); }
+                    catch { return debugRaw; }
+                  })()}
+                </pre>
+              ) : (
+                <p className="text-zinc-500 text-xs">No response yet</p>
+              )}
+            </div>
+
+            {/* System prompt */}
+            <div>
+              <p className="text-yellow-400 font-mono text-xs uppercase tracking-wider mb-2">
+                System prompt sent to Claude
+              </p>
+              {debugPrompt ? (
+                <pre className="text-zinc-300 font-mono text-xs bg-zinc-900 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap border border-zinc-700">
+                  {debugPrompt}
+                </pre>
+              ) : (
+                <p className="text-zinc-500 text-xs">Loading…</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Done overlay */}
       {isDone && (
