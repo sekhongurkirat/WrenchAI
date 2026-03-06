@@ -3,12 +3,82 @@
 import { useRef, useState, useEffect, useCallback } from "react";
 import type { AnalysisResult, HistoryEntry, OverlayType, Direction } from "@/lib/types";
 
-// ── Region grid ───────────────────────────────────────────────────────────────
+// ── Region grid — exact third-points so overlay aligns with grid sent to Claude ──
 const REGION_XY: Record<string, [number, number]> = {
-  TL: [0.18, 0.18], TC: [0.50, 0.18], TR: [0.82, 0.18],
-  CL: [0.18, 0.50], CC: [0.50, 0.50], CR: [0.82, 0.50],
-  BL: [0.18, 0.82], BC: [0.50, 0.82], BR: [0.82, 0.82],
+  TL: [1/6, 1/6], TC: [1/2, 1/6], TR: [5/6, 1/6],
+  CL: [1/6, 1/2], CC: [1/2, 1/2], CR: [5/6, 1/2],
+  BL: [1/6, 5/6], BC: [1/2, 5/6], BR: [5/6, 5/6],
 };
+
+// Crop the video frame to exactly what object-cover shows on screen,
+// then draw a labeled 3×3 grid so Claude can identify regions precisely.
+function captureVisibleFrameWithGrid(
+  video: HTMLVideoElement,
+  quality = 0.82
+): string | null {
+  if (video.videoWidth === 0) return null;
+
+  const dw = video.clientWidth;
+  const dh = video.clientHeight;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+
+  // Calculate object-cover source crop
+  const videoAspect = vw / vh;
+  const displayAspect = dw / dh;
+  let srcX = 0, srcY = 0, srcW = vw, srcH = vh;
+  if (videoAspect > displayAspect) {
+    // video wider → crop sides
+    srcW = vh * displayAspect;
+    srcX = (vw - srcW) / 2;
+  } else {
+    // video taller → crop top/bottom
+    srcH = vw / displayAspect;
+    srcY = (vh - srcH) / 2;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = dw;
+  canvas.height = dh;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  // Draw the visible portion of the video
+  ctx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, dw, dh);
+
+  // Draw 3×3 grid so Claude can see exactly where each region is
+  ctx.strokeStyle = "rgba(255,255,255,0.35)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 5]);
+  [dw / 3, (2 * dw) / 3].forEach((x) => {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, dh); ctx.stroke();
+  });
+  [dh / 3, (2 * dh) / 3].forEach((y) => {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(dw, y); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // Label each cell
+  const labels = [
+    ["TL", dw/6, dh/6], ["TC", dw/2, dh/6], ["TR", 5*dw/6, dh/6],
+    ["CL", dw/6, dh/2], ["CC", dw/2, dh/2], ["CR", 5*dw/6, dh/2],
+    ["BL", dw/6, 5*dh/6], ["BC", dw/2, 5*dh/6], ["BR", 5*dw/6, 5*dh/6],
+  ];
+  const fs = Math.max(14, Math.round(dw * 0.045));
+  ctx.font = `bold ${fs}px system-ui`;
+  ctx.textAlign = "center";
+  labels.forEach(([label, x, y]) => {
+    const lx = Number(x), ly = Number(y);
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.beginPath();
+    ctx.roundRect(lx - fs, ly - fs * 0.8, fs * 2, fs * 1.2, 4);
+    ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fillText(String(label), lx, ly + fs * 0.35);
+  });
+
+  return canvas.toDataURL("image/jpeg", quality);
+}
 
 // ── Canvas action overlays ────────────────────────────────────────────────────
 function drawArrowhead(
@@ -548,7 +618,9 @@ export default function ARCamera({ vehicle, repairType, repairLabel, onBack }: P
     isAnalyzingRef.current = true;
     setAnalyzing(true);
 
-    const rawImage = withImage ? captureFrame() : null;
+    const rawImage = withImage
+      ? captureVisibleFrameWithGrid(videoRef.current!, 0.82)
+      : null;
     if (rawImage) setDebugFrame(rawImage);
 
     try {
